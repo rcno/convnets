@@ -11,7 +11,9 @@ import os
 def create_and_train(imgpath, ntrain):
     """Example function"""
     spec = basicspec()
-    spec.update(insize=299, layer_ch=[1,4,8,16,32,64], ksizes=[3]*5, fcsizes=[], hdim=2048, maxpool=[1, 3, 4, 5])
+    #spec.update(insize=299, res=False, layer_ch=[1, 4, 8, 16, 32, 64], ksizes=[3] * 5, fcsizes=[], hdim=2048, maxpool=[1, 3, 4])
+    spec.update(insize=299, res=True, layer_ch=[1,4,8,16,32,64], ksizes=[3]*5, fcsizes=[], hdim=2048, maxpool=[1, 3, 4])
+    #spec.update(insize=299, res=True, layer_ch=[1, 4, 8, 16, 32, 64], ksizes=[3] * 5, fcsizes=[], hdim=2048, maxpool=False)
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     convae = ConvAE(spec).to(device)
     traindat = create_dataset(imgpath, eind=ntrain)
@@ -137,7 +139,9 @@ class ConvAE(nn.Module):
     Note that if there are no maxpool layers then the convolution blocks get stride 2.
 
     The decoder uses transpose convolution layers, optional batchnorm and relu activations, where
-    the encoder maxpool layers correspond to transpose convolutions with kernel size 2 and stride 2.
+    the encoder maxpool layers correspond to transpose convolutions with stride 2.
+    The decoder has a final upsampling layer because the transpose convolution may not
+    exactly match the sizes of the conv/maxpool layers in the encoder.
 
     The spec should contain the following parameters:
         - layer_ch gives the number of channels in each layer, **starting with the number of channels in the input image**.
@@ -145,161 +149,219 @@ class ConvAE(nn.Module):
         - hdim gives the size of the code layer. 
         - ksizes gives the sizes of the kernels in the convolution layers.
         - maxpool is a list of conv layers that have maxpool at the **end**, counting from zero
-        - p1 and p2 are padding for even and odd **convolution** layers respectively
+        - pad is the padding for the convolution layers, ignored for residual version as the skip connection needs different pad.
         - Note that the parameters layer_ch, maxpool and ksizes have indexes corresponding to the convolution layers,
           so not counting the maxpool layers.
     """
 
     def __init__(self, spec):
         super().__init__()
-        self.imgsizes = None
-        self.fcsizes = None
+        self.insize = spec.get("insize")
+        self.layer_ch = spec.get("layer_ch")
+        self.fcsizes = spec.get("fcsizes", [])
+        self.hdim = spec.get("hdim", 100)
+        self.ksizes = spec.get("ksizes")
+        self.maxpool = spec.get("maxpool", [])
+        self.batchnorm = spec.get("batchnorm", True)
+        self.p1 = spec.get("pad", 0)
+        self.sigact = spec.get("sigact", False)
+        self.res = spec.get("res", False)
+        self.longskip = spec.get("longskip", [])
+        ##########################################
+        self.encimgsizes = None
+        self.decimgsizes = None
+        self.flatdim = None
+
         print("Constructing encoder")
-        self.enc = self.make_enc(spec)
-        print(self.imgsizes)
+        self.enc = self.make_enc()
+        self.test_sizes(encoder=True)
+        print("Encoder sizes", self.encimgsizes)
+
         print("Constructing decoder")
-        self.dec = self.make_dec(spec, self.imgsizes)
-        print(self.fcsizes)
+        self.dec = self.make_dec()
+        self.test_sizes(encoder=False)
+        print("Longskip", self.longskip)
+        print("Fully connected sizes", self.fcsizes)
+        print("Decoder sizes", self.decimgsizes)
 
-    def make_enc(self, spec):
-        insize = spec.get("insize")
-        layer_ch = spec.get("layer_ch")
-        fcsizes = spec.get("fcsizes", [])
-        hdim = spec.get("hdim", 100)
-        ksizes = spec.get("ksizes")
-        maxpool = spec.get("maxpool", [])
-        batchnorm = spec.get("batchnorm", True)
-        p1 = spec.get("pad", 0)
-        bias = not batchnorm
+    def test_sizes(self, encoder=True):
+        test = torch.ones(1, self.layer_ch[0], self.insize, self.insize) if encoder \
+            else torch.ones(1, self.layer_ch[-1], self.decimgsizes[0], self.decimgsizes[0])
+        convs = self.enc[0] if encoder else self.dec[1]
+        for i, layer in enumerate(convs):
+            test = layer(test)
+            esize = self.encimgsizes[i + 1] if encoder else self.decimgsizes[i+1]
+            assert test.shape[-1] == esize, "output shape is {}, stored size is {}".format(test.shape[-1],esize)
 
-        assert len(layer_ch) - 1 == len(ksizes), "See documentation of class"
+    def make_enc(self):
+        assert len(self.layer_ch) - 1 == len(self.ksizes), "See documentation of class"
 
-        nconvs = len(layer_ch) - 1  ##first item is image channels
-        stride = 1 if maxpool else 2
-        currentsize = insize
-        self.imgsizes = [currentsize]
-
-        mlist = []
-        for i in range(nconvs):
-            pad = p1
-            mlist.append(
-                #ResBlock(layer_ch[i], layer_ch[i + 1], kernel_size=ksizes[i], stride=stride, bias=bias, batchnorm=batchnorm))
-                ##A block is a convolutional layer, optional batchnorm and ReLU activation
-                Conv2dBlock(layer_ch[i], layer_ch[i + 1], kernel_size=ksizes[i], stride=stride, bias=bias,
-                            batchnorm=batchnorm, padding=pad))
-            currentsize = math.floor((currentsize - ksizes[i] + 2 * pad) / stride + 1)
-            self.imgsizes.append(currentsize)
-            if maxpool and (i in maxpool):
-                mlist.append(nn.MaxPool2d(kernel_size=2, stride=2))
-                currentsize = currentsize // 2
-                self.imgsizes.append(currentsize)
-        ##todo: some check that imgsize is not zero
-        conv = nn.Sequential(*mlist)
+        conv = self.make_enc_conv()
+        currentsize = self.encimgsizes[-1]
 
         ##Encoder fully connected layers
-        flatdim = (layer_ch[-1] * currentsize ** 2)
-        self.fcsizes = [flatdim]
+        self.flatdim = (self.layer_ch[-1] * currentsize ** 2)
+        currentsize = self.flatdim
         fcenc = nn.Sequential()
         fcenc.append(nn.Flatten(start_dim=1))
-        if len(fcsizes) > 0:
-            for i, _ in enumerate(fcsizes):
-                inch = flatdim if i == 0 else fcsizes[i-1]
-                fc = FcBlock(inch, fcsizes[i], bias=bias, batchnorm=batchnorm)
+        if len(self.fcsizes) > 0:
+            for i, _ in enumerate(self.fcsizes):
+                fc = FcBlock(currentsize, self.fcsizes[i], batchnorm=self.batchnorm)
                 fcenc.append(fc)
-                self.fcsizes.append(fcsizes[i])
+                currentsize = self.fcsizes[i]
         ##final layer connecting to hdim
-        if self.fcsizes[-1] != hdim:
-            fcenc.append(FcBlock(self.fcsizes[-1], hdim, bias=bias, batchnorm=batchnorm))
+        if currentsize != self.hdim:
+            fcenc.append(FcBlock(currentsize, self.hdim, batchnorm=self.batchnorm))
 
         ##initialise layers
+        # print("Doing orthogonal init")
+        print("Doing Kaiming normal init")
         for m in [conv, fcenc]:
+            #m.apply(self.initlayer, orthinit=True)
             m.apply(self.initlayer)
 
         return nn.Sequential(conv, fcenc)
 
-###########################################################################################################
-    def make_dec(self, spec, imgsizes):
-        assert imgsizes
+    def make_enc_conv(self):
+        nconvs = len(self.layer_ch) - 1  ##first item is image channels
+        stride = 1 if self.maxpool else 2  ##decoder uses this
+        currentsize = self.insize
+        self.encimgsizes = [currentsize]
+        mlist = []
+        for i in range(nconvs):
+            if self.res:
+                ##Residual block with 2 convs, last is same, adjusts pad such that output size is (n (-1))//stride
+                ci = ResBlock(currentsize, self.layer_ch[i], self.layer_ch[i + 1], kernel_size=self.ksizes[i], stride=stride,
+                              batchnorm=self.batchnorm)
+                currentsize = ci.outsize
+            else:
+                ##A block is a convolutional layer, optional batchnorm and ReLU activation
+                ci = Conv2dBlock(self.layer_ch[i], self.layer_ch[i + 1], kernel_size=self.ksizes[i], stride=stride,
+                                 batchnorm=self.batchnorm, padding=self.p1)
+                currentsize = math.floor((currentsize - self.ksizes[i] + 2 * self.p1) / stride) + 1
+            mlist.append(ci)
+            self.encimgsizes.append(currentsize)
+            if self.maxpool and (i in self.maxpool):
+                mlist.append(nn.MaxPool2d(kernel_size=2, stride=2))
+                currentsize = currentsize // 2
+                self.encimgsizes.append(currentsize)
+        ##todo: some check that imgsize is not zero
+        conv = nn.Sequential(*mlist)
+        return conv
 
-        insize = spec.get("insize")
-        layer_ch = spec.get("layer_ch")
-        fcsizes = spec.get("fcsizes", [])
-        hdim = spec.get("hdim", 100)
-        ksizes = spec.get("ksizes")
-        maxpool = spec.get("maxpool", [])
-        batchnorm = spec.get("batchnorm", True)
-        p1 = spec.get("pad", 0)
-        sigact = spec.get("sigact", False)
-        bias = not batchnorm
+    ###########################################################################################################
+    def make_dec(self):
+        assert self.encimgsizes
 
         ##Decoder fully connected layers
-        flatdim = (layer_ch[-1] * imgsizes[-1] ** 2)
         fcdec = nn.Sequential()
-        ##first layer connecting to hdim
-        if hdim != self.fcsizes[-1]:
-            fcdec.append(FcBlock(hdim, self.fcsizes[-1], bias=bias, batchnorm=batchnorm))
-        if len(fcsizes) > 0:
-            for i in range(1, len(fcsizes)+1):
-                outch = flatdim if i == len(fcsizes) else fcsizes[-i-1]
-                fc = FcBlock(fcsizes[-i], outch, bias=bias, batchnorm=batchnorm)
+        currentsize = self.hdim
+        if len(self.fcsizes) > 0:
+            for i in range(len(self.fcsizes)):
+                fc = FcBlock(currentsize, self.fcsizes[-i-1], batchnorm=self.batchnorm)
                 fcdec.append(fc)
-        fcdec.append(nn.Unflatten(dim=1, unflattened_size=(layer_ch[-1], imgsizes[-1], imgsizes[-1])))
+                currentsize = self.fcsizes[-i-1]
+        ##final layer connecting to flatdim
+        fcdec.append(FcBlock(currentsize, self.flatdim, batchnorm=self.batchnorm))
+        fcdec.append(nn.Unflatten(dim=1, unflattened_size=(self.layer_ch[-1], self.encimgsizes[-1], self.encimgsizes[-1])))
 
-        # Decoder convolutions
-        assert len(layer_ch) - 1 == len(ksizes)
-        nconvs = len(layer_ch) - 1
-
-        currentsize = imgsizes[-1]
-        ix = 1
-        mlist = []
-        for i in range(1, nconvs+1):
-            ##j = nconvs-i, -i = j-nconvs; j: nconvs-1 --->0
-            ##if we have conv+maxpool in encoder, use a doubling (stride 2) convtrans in decoder, may get one too small output, so use final upscaling
-            ##if we have only conv in encoder, use an inverse convtrans
-            if maxpool and ((nconvs - i) in maxpool):
-                ##old version: usibng 2 invconvblocks (1 for inverse of maxpool), this trains badly without batchnorm
-                pad = math.floor((ksizes[-i]-1)/2) ##adapt so we get doubling convtrans
-                mlist.append(Inv_Convblock(currentsize, layer_ch[-i], layer_ch[-i - 1], ks=ksizes[-i],
-                                           stride=2, bias=bias, batchnorm=batchnorm, pad=pad, outpad=1))
-                currentsize = mlist[-1].outsize # should be currentsize*2
-                ix += 1
-            else:
-                stride = 2 if ((imgsizes[-ix - 1] + 2 * p1) // currentsize) == 2 else 1
-                outpad = 1 if (stride * (currentsize - 1) + ksizes[-i] - 2 * p1) < imgsizes[-ix - 1] else 0
-                mlist.append(Inv_Convblock(currentsize, layer_ch[-i], layer_ch[-i - 1], ks=ksizes[-i],
-                                           stride=stride, bias=bias, batchnorm=batchnorm, pad=p1, outpad=outpad))
-                currentsize = mlist[-1].outsize
-                ix += 1
-            print("i {}, currentsize {}".format(i, currentsize))
-        # last conv transpose activation should be something other than relu to give real-valued output
-        mlist[-1].act = nn.Sigmoid() if sigact else nn.Identity()
-        ##final upsample
-        mlist.append(nn.Upsample(size=imgsizes[0], mode="bilinear"))
-        currentsize = imgsizes[0]
-        #print("i {} currentsize {}".format(i, currentsize))
-
-        assert currentsize == insize, "currentsize is {}, input size is {}, sizelist is {}".format(currentsize, insize, imgsizes)
-        conv = nn.Sequential(*mlist)
+        conv = self.make_dec_conv()
 
         ##initialise layers
+        # print("Doing orthogonal init")
+        print("Doing Kaiming normal init")
         for m in [fcdec, conv]:
+            # m.apply(self.initlayer, orthinit=True)
             m.apply(self.initlayer)
 
         return nn.Sequential(fcdec, conv)
 
+    def make_dec_conv(self):
+        assert len(self.layer_ch) - 1 == len(self.ksizes)
+        nconvs = len(self.layer_ch) - 1
+        currentsize = self.encimgsizes[-1]
+        ix = 1
+        self.decimgsizes = [currentsize]
+        mlist = []
+        for i in range(1, nconvs + 1):
+            ##j = nconvs-i, -i = j-nconvs; j: nconvs-1 --->0
+            ismaxpool = self.maxpool and ((nconvs - i) in self.maxpool)
+            if self.res:
+                ##note: may get somewhat too small output as invresblock uses padding based on
+                #reversing convolutions, not maxpool, so use final upscaling
+                ci = self.make_resinvblock(currentsize, maxoutsize=self.encimgsizes[-ix-1], i=i, domaxpool=ismaxpool)
+            else:
+                ##if we have conv(stride 1) followed by maxpool in encoder, use a doubling (stride 2) convtrans in decoder,
+                # may get too small output due to initial conv, so use final upscaling
+                ci = self.make_invblock(currentsize, maxoutsize=self.encimgsizes[-ix-1], i=i, domaxpool=ismaxpool)
+            ix = ix + 2 if ismaxpool else ix + 1
+            mlist.append(ci)
+            currentsize = ci.outsize
+            self.decimgsizes.append(currentsize)
+            #print("i {}, currentsize {}".format(i, currentsize))
+        # last conv transpose activation should be something other than relu to give real-valued output
+        mlist[-1].act = nn.Sigmoid() if self.sigact else nn.Identity()
+        ##final upsample
+        mlist.append(nn.Upsample(size=self.encimgsizes[0], mode="bilinear"))
+        self.decimgsizes.append(self.encimgsizes[0])
+        conv = nn.Sequential(*mlist)
+        return conv
+
+    def make_resinvblock(self, currentsize, maxoutsize, i, domaxpool):
+        stride = 2 if domaxpool else (1 if self.maxpool else 2)
+        pad = self.ksizes[-i] // 2 ##this is the padding used in the inverse resblock convolution
+        realoutsize = calc_invconvoutsize(currentsize, self.ksizes[-i], maxoutsize, pad, stride)
+        ci = InvResBlock(currentsize, realoutsize, self.layer_ch[-i], self.layer_ch[-i - 1], kernel_size=self.ksizes[-i],
+                         stride=stride, batchnorm=self.batchnorm)
+        return ci
+
+    def make_invblock(self, currentsize, maxoutsize, i, domaxpool):
+        if domaxpool:
+            stride = 2
+            pad = calc_invmpoolpad(self.ksizes[-i], maxoutsize)
+            realoutsize = calc_invconvoutsize(currentsize, self.ksizes[-i], maxoutsize, pad, stride)
+            ci = InvConvblock(currentsize, realoutsize, self.layer_ch[-i], self.layer_ch[-i - 1], kernel_size=self.ksizes[-i],
+                              stride=stride, batchnorm=self.batchnorm, pad=pad)
+        else:
+            stride = 1 if self.maxpool else 2
+            pad = self.p1
+            realoutsize = calc_invconvoutsize(currentsize, self.ksizes[-i], maxoutsize, pad, stride)
+            ci = InvConvblock(currentsize, realoutsize, self.layer_ch[-i], self.layer_ch[-i - 1], kernel_size=self.ksizes[-i],
+                              stride=stride, batchnorm=self.batchnorm, pad=pad)
+        return ci
+
+
+    def make_invresblock(self, currentsize, outsize, i, stride):
+        ci = InvResBlock(currentsize, outsize, self.layer_ch[-i], self.layer_ch[-i - 1], kernel_size=self.ksizes[-i],
+                         stride=stride, batchnorm=self.batchnorm)
+        return ci
+
     def forward(self, x):
-        h = self.enc(x)
-        xrec = self.dec(h)
+        #h = self.enc(x)
+        # store results on convolutions
+        inter = [] 
+        nconvs = len(self.enc[0])
+        for i, layer in enumerate(self.enc[0]):
+            x = layer(x)
+            if self.longskip and (i in self.longskip): 
+                inter.append(x)
+        h = self.enc[1](x)
+        xrec = self.dec[0](h)
+        for i, layer in enumerate(self.dec[1]):
+            if self.longskip and (nconvs - 1 - i in self.longskip) and (not isinstance(layer, torch.nn.modules.upsampling.Upsample)):
+                skipcon = inter.pop()
+                xrec = layer(skipcon + xrec)
+            else:
+                xrec = layer(xrec)
+        #xrec = self.dec(h)
         return xrec
 
     @staticmethod
     def initlayer(m, orthinit=False):
         if (isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.ConvTranspose2d)):
             if orthinit:
-                print("Doing orthogonal init")
                 torch.nn.init.orthogonal_(m.weight.data)
             else:
-                print("Doing Kaiming normal init")
                 torch.nn.init.kaiming_normal_(m.weight.data, nonlinearity='relu')
 
 
@@ -309,9 +371,10 @@ class Conv2dBlock(nn.Module):
     Note the high value for the batch-norm momentum, this is to make training and test more similar.
     Also note that pytorch defines momentum in an unintuitive way, see https://github.com/pytorch/pytorch/issues/41559
     """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, bias=True, batchnorm=True, mom=0.8, padding=0):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, batchnorm=True, mom=0.8, padding=0):
         super().__init__()
         self.batchnorm = batchnorm
+        bias = not batchnorm
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias)
         if self.batchnorm:
             self.bn = nn.BatchNorm2d(out_channels, momentum=mom)
@@ -325,28 +388,26 @@ class Conv2dBlock(nn.Module):
         return xa
 
 
-class Inv_Convblock(nn.Module):
+class InvConvblock(nn.Module):
     """
     layer corresponding to convolution in encoder
     ##NB: conv operation can have input size 2n or 2n+1 for output size n,
     ##so might need to add output padding to get corresponding size here
     """
-    def __init__(self, insize, inch, outch, ks, stride, bias=True, batchnorm=True, pad=0, outpad=0, mom=0.8):
+    def __init__(self, insize, outsize, inch, outch, kernel_size, stride, batchnorm=True, pad=0, mom=0.8):
         super().__init__()
-        #newsize = stride * (insize - 1) + ks - 2 * pad
-        #if not (outsize in [newsize, newsize + 1]):
-        ##raise AssertionError("target size is {}, but previous size is {}, new is {}".format(outsize, insize,newsize))
-        #outpad = 0 if outsize == newsize else 1
-        self.convtrans = nn.ConvTranspose2d(inch, outch, kernel_size=ks, stride=stride,
+        bias = not batchnorm
+        outpad = calc_outpad(kernel_size, pad, stride, outsize)
+        self.convtrans = nn.ConvTranspose2d(inch, outch, kernel_size=kernel_size, stride=stride,
                                             output_padding=outpad, bias=bias, padding=pad)
-        #self.outsize = newsize + outpad
-        self.outsize = stride * (insize - 1) + ks - 2 * pad + outpad
+        self.outsize = stride * (insize - 1) + kernel_size - 2 * pad + outpad
+        assert self.outsize == outsize, print("invconv outsize{}, required outsize {}".format(self.outsize, outsize))
         self.batchnorm = batchnorm
         if batchnorm:
             self.bn = nn.BatchNorm2d(outch, momentum=mom)
         self.act = nn.ReLU(inplace=True)
 
-    def forward(self,x):
+    def forward(self, x):
         x = self.convtrans(x)
         if self.batchnorm:
             x = self.bn(x)
@@ -360,8 +421,9 @@ class FcBlock(nn.Module):
     Note the high value for the batch-norm momentum, this is to make training and test more similar.
     Also note that pytorch defines momentum in an unintuitive way, see https://github.com/pytorch/pytorch/issues/41559
     """
-    def __init__(self, in_channels, out_channels, bias=True, batchnorm=True, mom=0.8):
+    def __init__(self, in_channels, out_channels, batchnorm=True, mom=0.8):
         super().__init__()
+        bias = not batchnorm
         self.fc = nn.Linear(in_channels, out_channels, bias=bias)
         self.batchnorm = batchnorm
         if self.batchnorm:
@@ -376,57 +438,65 @@ class FcBlock(nn.Module):
         return xa
 
 
-
 class InvResBlock(nn.Module):
     """
+    Inverse of ResBlock
     """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, bias=True, batchnorm=True, mom=0.8):
+    def __init__(self, insize, outsize, in_channels, out_channels, kernel_size, stride, batchnorm=True, mom=0.8):
         super().__init__()
         assert (kernel_size % 2) == 1, "Need odd kernel to make same conv"
-        pad = (kernel_size - 1) / 2
-        self.batchnorm = batchnorm
-        ##the first conv can change the image size by using stride!=1
-        self.conv1 = Conv2dBlock(in_channels, out_channels, kernel_size=kernel_size, stride=stride, batchnorm=batchnorm,
-                                 padding=pad, bias=bias, mom=mom)
-        ##the second conv should preserve the image size
-        self.conv2 = Conv2dBlock(out_channels, out_channels, kernel_size=kernel_size, stride=1, batchnorm=batchnorm,
-                                 padding=pad, bias=bias, mom=mom)
-        self.conv2.relu = nn.Identity()  ##NB: remove relu in last block
-        ###convskip has kernel size 1 and transforms #channels and image size like the first conv
-        ###kernel 1 and stride 2 is just subsampling every other pixel across all channels.
-        self.convskip = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride) \
+        pad = kernel_size // 2  ##this reduces kernel_size f in the output formula to (f mod 2) = 1 for f odd
+        self.batchnorm = batchnorm ##store for clarity
+        ##this conv should preserve the image size
+        self.convtrans1 = InvConvblock(insize, insize, in_channels, in_channels, kernel_size=kernel_size, stride=1,
+                                       batchnorm=batchnorm, pad=pad, mom=mom)
+        self.convtrans2 = InvConvblock(insize, outsize, in_channels, out_channels, kernel_size=kernel_size, stride=stride,
+                                       batchnorm=batchnorm, pad=pad, mom=mom)
+        self.convtrans2.relu = nn.Identity() ##NB: remove relu in last block
+        self.outsize = self.convtrans2.outsize
+        ##this should be the same outpad as that used in the second InvConvblock, as we have set the
+        ##padding here and above to be floor(kernel/2), then the conv output only depends on kernel mod 2.
+        skipoutpad = calc_outpad(ks=1, pad=0, stride=stride, target=outsize)
+        ###convskip has kernel size 1 and transforms #channels and image size like the second conv
+        self.convskip = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=1, stride=stride,
+                                           padding=0, output_padding=skipoutpad) \
             if stride != 1 or in_channels != out_channels else nn.Identity()
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        x1 = self.conv1(x)
-        x2 = self.conv2(x1)
+        x1 = self.convtrans1(x)
+        x2 = self.convtrans2(x1)
         xskip = self.convskip(x)
         xa = self.relu(x2 + xskip)
         return xa
-
 
 
 class ResBlock(nn.Module):
     """
+    Block has a conv part and a skip connection.
+    The conv part has two convolutions, the first outputs image of size n//stride or (n+1)//stride and out_channels channels, the second keeps the image size and
+    channels.
+    The skip connection uses a 1*1 kernel and changes the image size and channels like the first convolution.
     """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, bias=True, batchnorm=True, mom=0.8):
+    def __init__(self, insize, in_channels, out_channels, kernel_size, stride, bias=True, batchnorm=True, mom=0.8):
         super().__init__()
-        assert (kernel_size % 2) == 1, "Need odd kernel to make same conv"
-        pad = (kernel_size - 1) / 2
-        self.batchnorm = batchnorm
-        ##the first conv can change the image size by using stride!=1
+        assert (kernel_size % 2) == 1, "Need odd kernel for res block"
+        pad = kernel_size // 2 ##this reduces kernel_size f in the output formula to (f mod 2) = 1 for f odd
+        self.batchnorm = batchnorm ##store for clarity
+        ##the first conv can change the image size to (n (+1))//stride by using stride!=1
         self.conv1 = Conv2dBlock(in_channels, out_channels, kernel_size=kernel_size, stride=stride, batchnorm=batchnorm,
-                                 padding=pad, bias=bias, mom=mom)
-        ##the second conv should preserve the image size
+                                 padding=pad, mom=mom)
+        self.outsize = math.floor((insize - kernel_size + 2 * pad) / stride) + 1
+        ##the second conv should preserve the image size, so use stride 1
         self.conv2 = Conv2dBlock(out_channels, out_channels, kernel_size=kernel_size, stride=1, batchnorm=batchnorm,
-                                 padding=pad, bias=bias, mom=mom)
+                                 padding=pad, mom=mom)
         self.conv2.relu = nn.Identity()  ##NB: remove relu in last block
         ###convskip has kernel size 1 and transforms #channels and image size like the first conv
         ###kernel 1 and stride 2 is just subsampling every other pixel across all channels.
-        self.convskip = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride) \
+        self.convskip = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, padding=0) \
             if stride != 1 or in_channels != out_channels else nn.Identity()
         self.relu = nn.ReLU(inplace=True)
+
 
     def forward(self, x):
         x1 = self.conv1(x)
@@ -436,6 +506,24 @@ class ResBlock(nn.Module):
         return xa
 
 
+## try to do outpad such that inverse convolution outputs maxoutsize, return closest output size
+def calc_invconvoutsize(currentsize, ks, maxoutsize, pad, stride):
+    outpad = calc_outpad(ks, pad, stride, maxoutsize)
+    realoutsize = calc_invsize(currentsize, ks, outpad, pad, stride=stride)
+    if realoutsize < maxoutsize:
+        realoutsize = calc_invsize(currentsize, ks, outpad=stride - 1, pad=pad, stride=stride)
+    return realoutsize
+
+def calc_invsize(insize, kernel_size, outpad, pad, stride):
+    return stride * (insize - 1) + kernel_size - 2 * pad + outpad
+
+def calc_outpad(ks, pad, stride, target):
+    q = (target - ks + 2 * pad) % stride
+    return q
+
+def calc_invmpoolpad(kernel_size, outsize):
+    pad = kernel_size // 2 if (outsize % 2 == 0) else (kernel_size - 1) // 2
+    return pad
 ####################################################################
 
 
