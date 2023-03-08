@@ -38,6 +38,19 @@ def imagepathlist(imgpath):
     return [os.path.join(imgpath, p) for p in list(os.listdir(imgpath))]
 
 
+def plot_rand_channels(firstimg,outchannels,nrows,ncols):
+    fig, ax = plt.subplots(nrows=nrows,ncols=ncols,figsize=(25,8))
+    nch = outchannels.shape[0]
+    randinds = np.random.choice(nch,size=nrows*ncols)
+    ax[0,0].imshow(firstimg)
+    for i in range(nrows):
+        for j in range(ncols):
+            if i == 0 and j == 0:
+                continue 
+            ax[i,j].imshow(outchannels[randinds[ncols*i + j - 1]])
+            ax[i,j].set_title(randinds[ncols*i + j - 1])
+    plt.subplots_adjust(left=0.3,right=0.7,top=0.95,bottom=0.05, hspace=0.1,wspace=0.3)
+
 def pairplot(first,second, figsize=(7,7)):
     omin = torch.min(torch.cat((first.squeeze(), second.squeeze())))
     omax = torch.max(torch.cat((first.squeeze(), second.squeeze())))
