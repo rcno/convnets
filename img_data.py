@@ -124,15 +124,32 @@ class ImageDataSet(torch.utils.data.Dataset):
             ##Note the squeeze to get rid of possible single channel
             image = Image.fromarray(np.squeeze(intimg), mode=self.imgmode)
         if self.resize is not None:
-            image = image.resize(self.resize, resample=Image.Resampling.BILINEAR)
+            if type(self.resize) is not int and len(self.resize) == 2:
+                image = image.resize(self.resize, resample=Image.Resampling.BILINEAR)
+            else:
+                newsize = self.resize_minlen(image, self.resize)
+                if newsize: 
+                    image = image.resize(newsize, resample=Image.Resampling.BILINEAR)
         ##convert png palette to 4 channels and drop transparency channel
         if hasattr(image, "mode") and image.mode == "P":
             image = np.array(image.convert())[:, :, :3]
-        ##convert to normal float
+        ##convert to normal float - note that this has ordering (height, width), but PIL has ordering (width,height), so dimension representation is flipped 
         img = np.array(image, dtype=np.float32)
         img = self.fixchannelshape(img, self.imgmode)
         scaledimage = self.scale(img)
         return scaledimage
+
+    @staticmethod
+    def resize_minlen(image, minlen):
+        isize = [image.width, image.height]
+        ls, ss = isize[np.argmax(isize)], isize[np.argmin(isize)]
+        sratio = ls/ss
+        newsize = isize.copy()
+        if ss > minlen:
+            return None
+        newsize[np.argmin(isize)] = np.max((minlen, ss))
+        newsize [np.argmax(isize)] = int(sratio *  newsize[np.argmin(isize)])
+        return tuple(newsize)
 
     def scale(self, img):
         if self.scaling == "standard":

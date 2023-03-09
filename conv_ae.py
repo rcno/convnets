@@ -4,6 +4,7 @@ import torch.nn as nn
 import math
 from tqdm import tqdm
 import os
+import matplotlib.pyplot as plt
 
 #from img_ae.img_data import *
 
